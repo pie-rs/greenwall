@@ -1,0 +1,556 @@
+# Establish Substitutions
+substitutions:
+  device_name: sprinkler
+  friendly_name: "Sprinkler"
+  device_platform: ESP32
+  device_board: esp32dev
+  device_ip: X.X.X.X
+  sensor_update_frequency: 1s
+  sprinkler_name: esp32_sprinkler_ctrlr
+
+packages:
+  wifi: !include common/device_wifi.yaml
+  device_base: !include common/device_base_ESP32.yaml
+  home_assistant_api: !include common/device_api.yaml
+  sensor_wifi_ip_address: !include common/sensor_wifi_ip_address.yaml  
+
+# Enable logging
+logger:
+###################################################################################################
+#####  I/O expander hub definition
+###################################################################################################
+mcp23017:
+  - id: 'mcp23017_hub'
+    address: 0x20
+#nodemcu devkit v4.0
+i2c:
+  sda: 21
+  scl: 22
+  scan: True
+  frequency: 200kHz
+###################################################################################################
+# 10x4 LCD config
+display:
+  - platform: lcd_pcf8574
+    dimensions: 20x4
+    address: 0x27
+    update_interval: 1s
+    lambda: |-
+        switch (id(esp32_sprinkler_ctrlr).active_valve().value_or(-1)) {
+
+          case -1:
+          it.strftime(0, 0, "%a", id(homeassistant_time).now());
+          it.strftime(10, 0, "%d-%m-%Y", id(homeassistant_time).now());
+          it.strftime(12, 1,"%H:%M:%S", id(homeassistant_time).now());
+          it.printf(0, 3, "Status: %s", id(esp32_sprinkler_ctrlr_status).state.c_str());
+          
+          if (id(esp32_sprinkler_ctrlr_status).state == "Paused") {
+          it.printf(0, 2, "Zone %s", id(zone_active_sensor).state.c_str());
+          it.printf(10, 2, "T: %s", id(zone_time_remaining_sensor).state.c_str());
+          }
+
+          break;
+          
+          default:
+          it.printf(0, 0, "Zone %s:", id(zone_active_sensor).state.c_str());
+          it.printf(8, 0, "%s", id(zone_active_sensor).state.c_str() ? "ON" : "OFF");
+          it.printf(0, 1, "Time Letf: %s", id(zone_time_remaining_sensor).state.c_str());
+          break;
+        }
+
+output:
+  - platform: ledc
+    pin: GPIO14
+    id: sprinkler_backlight
+
+light:
+  - platform: monochromatic
+    output: sprinkler_backlight
+    name: "LCD Display Sprinkler Backlight"
+    id: light_backlight
+    restore_mode: ALWAYS_ON
+
+###################################################################################################
+###################################################################################################
+# Enable Home Assistant APIs
+api:
+  reboot_timeout: 0s
+  services:
+    - service: set_multiplier
+      variables:
+        multiplier: float
+      then:
+        - sprinkler.set_multiplier:
+            id: esp32_sprinkler_ctrlr
+            multiplier: !lambda 'return multiplier;'
+    - service: start_full_cycle
+      then:
+        - sprinkler.start_full_cycle: esp32_sprinkler_ctrlr
+    - service: start_single_valve
+      variables:
+        valve: int
+      then:
+        - sprinkler.start_single_valve:
+            id: esp32_sprinkler_ctrlr
+            valve_number: !lambda 'return valve;'
+    - service: next_valve
+      then:
+        - sprinkler.next_valve: esp32_sprinkler_ctrlr
+    - service: previous_valve
+      then:
+        - sprinkler.previous_valve: esp32_sprinkler_ctrlr
+    - service: shutdown
+      then:
+        - sprinkler.shutdown: esp32_sprinkler_ctrlr
+    - service: pause
+      then:
+        - sprinkler.pause: esp32_sprinkler_ctrlr
+    - service: resume
+      then:
+        - sprinkler.resume: esp32_sprinkler_ctrlr
+    - service: resume_or_full_cycle
+      then:
+        - sprinkler.resume_or_start_full_cycle: esp32_sprinkler_ctrlr
+    - service: repeat_2
+      then:
+        - sprinkler.set_repeat:
+            id: esp32_sprinkler_ctrlr
+            repeat: 2  # would run three cycles
+    - service: repeat_3
+      then:
+        - sprinkler.set_repeat:
+            id: esp32_sprinkler_ctrlr
+            repeat: 3  # would run three cycles
+
+# Main sprinkler code
+sprinkler:
+  - id: esp32_sprinkler_ctrlr
+    main_switch: "Master Run/Stop"
+    auto_advance_switch: "Zones Auto Advance"
+    reverse_switch: "Zones Reverse"
+    valve_open_delay: 2s
+    valves:
+      - valve_switch: "Zone 1"
+        enable_switch: "Zone 1 Enable"
+        run_duration: 900s
+        valve_switch_id: zone_valve_sw1
+      - valve_switch: "Zone 2"
+        enable_switch: "Zone 2 Enable"
+        run_duration: 900s
+        valve_switch_id: zone_valve_sw2
+      - valve_switch: "Zone 3"
+        enable_switch: "Zone 3 Enable"
+        run_duration: 900s
+        valve_switch_id: zone_valve_sw3
+      - valve_switch: "Zone 4"
+        enable_switch: "Zone 4 Enable"
+        run_duration: 900s
+        valve_switch_id: zone_valve_sw4
+      - valve_switch: "Zone 5"
+        enable_switch: "Zone 5 Enable"
+        run_duration: 900s
+        valve_switch_id: zone_valve_sw5
+      - valve_switch: "Zone 6"
+        enable_switch: "Zone 6 Enable"
+        run_duration: 900s
+        valve_switch_id: zone_valve_sw6
+
+# Valve control outputs config via I/O expander       
+switch:
+#################################################################################################
+####### CONTROL SWITCH
+#################################################################################################
+  - platform: template
+    id: esp32_sprinkler_ctrlr_run
+    name: "Sprinkler Controller Run"
+    optimistic: true
+    on_turn_on:
+      - text_sensor.template.publish:
+          id: esp32_sprinkler_ctrlr_status
+          state: "Running"
+      - sprinkler.resume_or_start_full_cycle: esp32_sprinkler_ctrlr
+      - switch.turn_off: esp32_sprinkler_ctrlr_pause
+      - switch.turn_off: esp32_sprinkler_ctrlr_stop
+  - platform: template
+    id: esp32_sprinkler_ctrlr_stop
+    name: "Sprinkler Controller Stop"
+    optimistic: true
+    on_turn_on:
+      - text_sensor.template.publish:
+          id: esp32_sprinkler_ctrlr_status
+          state: "Stopped"
+      - sprinkler.shutdown: esp32_sprinkler_ctrlr
+      - switch.turn_off: esp32_sprinkler_ctrlr_pause
+      - switch.turn_off: esp32_sprinkler_ctrlr_run
+  - platform: template
+    id: esp32_sprinkler_ctrlr_pause
+    name: "Sprinkler Controller Pause"
+    optimistic: true
+    
+    turn_on_action:
+      - delay: 500ms
+      - lambda: |-
+          if(id(esp32_sprinkler_ctrlr_status).state != "Running")
+          {
+            id(esp32_sprinkler_ctrlr_pause).turn_off();
+          }
+      - lambda: |-
+          if(id(esp32_sprinkler_ctrlr_status).state == "Running")
+          {
+            id(esp32_sprinkler_ctrlr_status).publish_state("Paused");
+            id(esp32_sprinkler_ctrlr).pause();
+          }
+    on_turn_off:
+      lambda: |-
+        if(id(esp32_sprinkler_ctrlr_status).state == "Paused")
+        {
+          id(esp32_sprinkler_ctrlr_status).publish_state("Running");
+          id(esp32_sprinkler_ctrlr).resume();
+        } 
+  - platform: template
+    id: esp32_sprinkler_ctrlr_resume
+    name: "Sprinkler Controller Resume"
+    optimistic: true
+     
+#################################################################################################
+####### I/0  SWITCH
+#################################################################################################
+  - platform: gpio
+    id: zone_valve_sw1
+    name: "MCP23017 Pin B2"
+    pin:
+      mcp23xxx: mcp23017_hub
+      # Use pin B2
+      number: 10
+      # One of INPUT or OUTPUT
+      mode:
+        output: true
+      inverted: true
+    internal: true
+  - platform: gpio
+    id: zone_valve_sw2
+    name: "MCP23017 Pin B3"
+    pin:
+      mcp23xxx: mcp23017_hub
+      # Use pin B3
+      number: 11
+      # One of INPUT or OUTPUT
+      mode:
+        output: true
+      inverted: true
+    internal: true
+  - platform: gpio
+    id: zone_valve_sw3
+    name: "MCP23017 Pin B4"
+    pin:
+      mcp23xxx: mcp23017_hub
+      # Use pin B4
+      number: 12
+      # One of INPUT or OUTPUT
+      mode:
+        output: true
+      inverted: true
+    internal: true
+  - platform: gpio
+    id: zone_valve_sw4
+    name: "MCP23017 Pin B5"
+    pin:
+      mcp23xxx: mcp23017_hub
+      # Use pin B5
+      number: 13
+      # One of INPUT or OUTPUT
+      mode:
+        output: true
+      inverted: true
+    internal: true
+  - platform: gpio
+    id: zone_valve_sw5
+    name: "MCP23017 Pin B6"
+    pin:
+      mcp23xxx: mcp23017_hub
+      # Use pin B6
+      number: 14
+      # One of INPUT or OUTPUT
+      mode:
+        output: true
+      inverted: true
+    internal: true
+  - platform: gpio
+    id: zone_valve_sw6
+    name: "MCP23017 Pin B7"
+    pin:
+      mcp23xxx: mcp23017_hub
+      # Use pin B7
+      number: 15
+      # One of INPUT or OUTPUT
+      mode:
+        output: true
+      inverted: true
+    internal: true
+  #- platform: template #this switch doesn't work properly. Can pause via HA frontend, but will not resume...  Via Services does work...
+  #  id: pause_switch
+  #  name: "Pause Irrigation Switch"
+  #  turn_on_action:
+  #    then:
+  #      - sprinkler.pause: esp32_sprinkler_ctrlr
+  #  turn_off_action:
+  #    then:
+  #      - sprinkler.resume: esp32_sprinkler_ctrlr    
+
+number:
+# Configuration to set multiplier via number
+  - platform: template
+    id: sprinkler_ctrlr_multiplier
+    name: "Run Duration Multiplier"
+    min_value: 1.0
+    max_value: 3.0
+    step: 0.1
+    mode: box
+    lambda: "return id(esp32_sprinkler_ctrlr).multiplier();"
+    set_action:
+      - sprinkler.set_multiplier:
+          id: esp32_sprinkler_ctrlr
+          multiplier: !lambda 'return x;'  
+          
+# Configure repeat
+  - platform: template
+    id: sprinkler_ctrlr_repeat_cycles
+    name: "Sprinkler Repeat Cycles"
+    min_value: 0
+    max_value: 300
+    step: 1
+    mode: box
+    lambda: "return id(esp32_sprinkler_ctrlr).repeat();"
+    set_action:
+      - sprinkler.set_repeat:
+          id: esp32_sprinkler_ctrlr
+          repeat: !lambda 'return x;'
+
+# Configuration to set valve run duration via number
+  - platform: template
+    id: sprinkler_valve_1_duration
+    name: "Zone 1 Duration"
+    icon: mdi:timer
+    unit_of_measurement: Min
+    min_value: 1
+    max_value: 120
+    step: 1.0
+    update_interval: $sensor_update_frequency
+    mode: box
+    lambda: "return id(esp32_sprinkler_ctrlr).valve_run_duration(0) / 60;"
+    set_action:
+      - sprinkler.set_valve_run_duration:
+          id: esp32_sprinkler_ctrlr
+          valve_number: 0
+          run_duration: !lambda "return x * 60;"
+          
+  - platform: template
+    id: sprinkler_valve_2_duration
+    name: "Zone 2 Duration"
+    icon: mdi:timer
+    unit_of_measurement: Min
+    min_value: 1
+    max_value: 120
+    step: 1.0
+    update_interval: $sensor_update_frequency
+    mode: box
+    lambda: "return id(esp32_sprinkler_ctrlr).valve_run_duration(1) / 60;"
+    set_action:
+      - sprinkler.set_valve_run_duration:
+          id: esp32_sprinkler_ctrlr
+          valve_number: 1
+          run_duration: !lambda "return x * 60;" 
+
+  - platform: template
+    id: sprinkler_valve_3_duration
+    name: "Zone 3 Duration"
+    icon: mdi:timer
+    unit_of_measurement: Min
+    min_value: 1
+    max_value: 120
+    step: 1.0
+    update_interval: $sensor_update_frequency
+    mode: box
+    lambda: "return id(esp32_sprinkler_ctrlr).valve_run_duration(2) / 60;"
+    set_action:
+      - sprinkler.set_valve_run_duration:
+          id: esp32_sprinkler_ctrlr
+          valve_number: 2
+          run_duration: !lambda "return x * 60;" 
+          
+  - platform: template
+    id: sprinkler_valve_4_duration
+    name: "Zone 4 Duration"
+    icon: mdi:timer
+    unit_of_measurement: Min
+    min_value: 1
+    max_value: 120
+    step: 1.0
+    update_interval: $sensor_update_frequency
+    mode: box
+    lambda: "return id(esp32_sprinkler_ctrlr).valve_run_duration(3) / 60;"
+    set_action:
+      - sprinkler.set_valve_run_duration:
+          id: esp32_sprinkler_ctrlr
+          valve_number: 3
+          run_duration: !lambda "return x * 60;"  
+          
+  - platform: template
+    id: sprinkler_valve_5_duration
+    name: "Zone 5 Duration"
+    icon: mdi:timer
+    unit_of_measurement: Min
+    min_value: 1
+    max_value: 120
+    step: 1.0
+    update_interval: $sensor_update_frequency
+    mode: box
+    lambda: "return id(esp32_sprinkler_ctrlr).valve_run_duration(4) / 60;"
+    set_action:
+      - sprinkler.set_valve_run_duration:
+          id: esp32_sprinkler_ctrlr
+          valve_number: 4
+          run_duration: !lambda "return x * 60;"
+          
+  - platform: template
+    id: sprinkler_valve_6_duration
+    name: "Zone 6 Duration"
+    icon: mdi:timer
+    unit_of_measurement: Min
+    min_value: 1
+    max_value: 120
+    step: 1.0
+    update_interval: $sensor_update_frequency
+    mode: box
+    lambda: "return id(esp32_sprinkler_ctrlr).valve_run_duration(5) / 60;"
+    set_action:
+      - sprinkler.set_valve_run_duration:
+          id: esp32_sprinkler_ctrlr
+          valve_number: 5
+          run_duration: !lambda "return x * 60;" 
+          
+sensor:
+### SENSORS
+  - platform: template
+    name: "Cycle Total Time Sensor"
+    icon: mdi:progress-clock    
+    unit_of_measurement: 'Min'
+    accuracy_decimals: 0
+    update_interval: $sensor_update_frequency  
+    lambda: "return id(esp32_sprinkler_ctrlr).valve_run_duration(0)/60 + id(esp32_sprinkler_ctrlr).valve_run_duration(1)/60;"
+    #lambda: |-
+    #  {% set ns = namespace(states=[]) %}
+    #  {% for s in states.sensor %}
+    #    {% if s.object_id.startswith('valve_run_') and s.object_id.endswith('_duration') %}
+    #      {% set ns.states = ns.states + [ s.state | float ] %}
+    #    {% endif %}
+    #  {% endfor %}
+    #  {{ ns.states | sum | round(2) }}
+#  - platform: template
+#    name: "Zone Active Sensor"
+#    id: zone_active_sensor
+#    unit_of_measurement: ''
+#    accuracy_decimals: 0
+#    #Valves are numbered from 0-7 internally which is an issue when displaying !
+#    lambda: |-
+#      if(id(esp32_sprinkler_ctrlr_status).state == "Stopped")
+#      {
+#        return id(esp32_sprinkler_ctrlr).active_valve().value_or(NAN);
+#      }
+#      else
+#      {
+#        return id(esp32_sprinkler_ctrlr).active_valve().value_or(NAN) + 1;
+#      }
+#    update_interval: $sensor_update_frequency
+  - platform: homeassistant
+    id: homeassistant_sprinklercountdown
+    entity_id: timer.sprinklercountdown
+    internal: false
+
+text_sensor:
+    - platform: template
+      id: esp32_sprinkler_ctrlr_status
+      name: "Sprinklers Status"
+      update_interval: $sensor_update_frequency
+    - platform: template
+      name: "Zone Active Sensor"
+      id: zone_active_sensor
+      #unit_of_measurement: ''
+      #accuracy_decimals: 0
+      #Valves are numbered from 0-7 internally which is an issue when displaying !
+      lambda: |-
+        if(id(esp32_sprinkler_ctrlr_status).state == "Stopped")
+        {
+          int zone_active = id(esp32_sprinkler_ctrlr).active_valve().value_or(NAN);
+          std::string zone_active_as_string = esphome::to_string(zone_active);
+          return zone_active_as_string;
+        }
+        else
+        {
+          int zone_active = id(esp32_sprinkler_ctrlr).active_valve().value_or(NAN) + 1;
+          std::string zone_active_as_string = esphome::to_string(zone_active);
+          return zone_active_as_string;
+        }
+      update_interval: $sensor_update_frequency
+
+#  # Expose Valve Progress Percent as a sensor.
+    - platform: template
+      id: progress_percent_valve
+      name: "Zone Progress"
+      #unit_of_measurement: '%'
+      #accuracy_decimals: 0
+      update_interval: $sensor_update_frequency
+      icon: "mdi:progress-clock"
+      lambda: |-
+        int valve_progress_percent = round(((id(esp32_sprinkler_ctrlr).valve_run_duration_adjusted(id(esp32_sprinkler_ctrlr).active_valve().value_or(0)) - id(esp32_sprinkler_ctrlr).time_remaining().value_or(0)) * 100 / id(esp32_sprinkler_ctrlr).valve_run_duration_adjusted(id(esp32_sprinkler_ctrlr).active_valve().value_or(0))));
+        std::string valve_progress_percent_as_string = esphome::to_string(valve_progress_percent);
+        return valve_progress_percent_as_string;
+
+# # Expose Zone Time Remaining
+    - platform: template
+      name: "Zone Time Remaining Sensor"
+      id: zone_time_remaining_sensor
+      icon: mdi:progress-clock    
+      #unit_of_measurement: 'Min'
+      #accuracy_decimals: 0
+      update_interval: $sensor_update_frequency
+      lambda: |-
+        if(id(esp32_sprinkler_ctrlr_status).state != "Paused")
+        {
+          int seconds = round(id(esp32_sprinkler_ctrlr).time_remaining().value_or(0));
+          int days = seconds / (24 * 3600);
+          seconds = seconds % (24 * 3600);
+          int hours = seconds / 3600;
+          seconds = seconds % 3600;
+          int minutes = seconds /  60;
+          seconds = seconds % 60;
+          return {
+            ((days ? String(days) + "d " : "") +
+            (hours ? String(hours) + "h " : "") +
+            (minutes ? String(minutes) + "m " : "") +
+            (String(seconds) + "s")
+            ).c_str()};
+        }
+        else
+        {
+          return {};
+        }
+
+### Input to managet the display backlight
+    - platform: homeassistant    
+      id: display_sprinkler_backlight
+      entity_id: input_number.sprinklerbacklightlevel
+      internal: true
+      on_value:
+        then:
+          - output.turn_on: sprinkler_backlight
+          - output.set_level:
+              id: sprinkler_backlight
+              level: !lambda |-
+                return atoi(id(display_sprinkler_backlight).state.c_str()) / 100.0;
+
+# Time source config
+time:
+  - platform: homeassistant
+    id: homeassistant_time
+    timezone: Europe/Rome
